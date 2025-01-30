@@ -124,6 +124,7 @@ class BenchmarkSuite:
         self.reference_datasets = reference_datasets
         self.multiprocessing = multiprocessing
         self.n_processes = n_processes
+        self.file_results = {}  # Store file-level results
 
         if self.multiprocessing:
             if len(benchmarks) > len(noise_datasets) + len(reference_datasets):
@@ -188,7 +189,6 @@ class BenchmarkSuite:
         return benchmark.get_distribution(dataset)
 
     def _run_benchmark(self, benchmark: "Benchmark", dataset: Dataset) -> dict:
-        # empty lines for better readability
         print("\n")
         print(f"{'='*80}")
         print(f"Benchmark Category: {benchmark.category.name}")
@@ -198,26 +198,35 @@ class BenchmarkSuite:
             print(f"Running {benchmark.name} on {dataset.name}")
         try:
             start = time()
-            score = benchmark.compute_score(
+            score, ci, datasets, file_results = benchmark.compute_score(
                 dataset, self.reference_distributions, self.noise_distributions
             )
             time_taken = time() - start
+            
+            # Store file results
+            if file_results:
+                if dataset.name not in self.file_results:
+                    self.file_results[dataset.name] = {}
+                self.file_results[dataset.name][benchmark.name] = file_results
+                
         except Exception as e:
             if self.skip_errors:
                 print(f"Error: {e}")
                 score = (np.nan, np.nan)
                 time_taken = np.nan
+                datasets = (None, None)
             else:
                 raise e
+
         result = {
             "benchmark_name": [benchmark.name],
             "benchmark_category": [benchmark.category.value],
             "dataset": [dataset.name],
-            "score": [score[0]],
-            "ci": [score[1]],
+            "score": [score],
+            "ci": [ci],
             "time_taken": [time_taken],
-            "noise_dataset": [score[2][0]],
-            "reference_dataset": [score[2][1]],
+            "noise_dataset": [datasets[0]],
+            "reference_dataset": [datasets[1]],
         }
         return result
 
@@ -309,7 +318,7 @@ class BenchmarkSuite:
         dataset_name: str,
         pca_components: Optional[int] = None,
     ) -> dict:
-        benchmark = [x for x in self.benchmark_objects if x.name == benchmark_name][0]
+        benchmark = [x for x in self.benchmarks.values() if x.name == benchmark_name][0]
         dataset = [x for x in self.datasets if x.name == dataset_name][0]
         closest_noise = self.database[
             (self.database["benchmark_name"] == benchmark_name)

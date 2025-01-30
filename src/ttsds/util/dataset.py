@@ -16,6 +16,7 @@ import librosa
 from multiprocessing import cpu_count
 from concurrent.futures import ThreadPoolExecutor
 
+from ttsds.util.audio import load_audio
 from ttsds.util.cache import cache, check_cache, load_cache, hash_md5
 
 
@@ -24,7 +25,7 @@ class Dataset(ABC):
     Abstract class for a dataset.
     """
 
-    def __init__(self, name, sample_rate: int = 22050, has_text: bool = True):
+    def __init__(self, name: str = None, sample_rate: int = 22050, has_text: bool = True):
         self.sample_rate = sample_rate
         self.wavs = []
         self.has_text = has_text
@@ -86,61 +87,48 @@ class DirectoryDataset(Dataset):
 
     def __init__(
         self,
-        root_dir: str = None,
-        sample_rate: int = 22050,
-        has_text: bool = True,
+        root_dir: Union[str, Path],
         text_suffix: str = ".txt",
-        name: str = None,
+        has_text: bool = True,
+        sample_rate: int = 22050,
     ):
-        if name is not None:
-            super().__init__(name, sample_rate, has_text)
-        else:
-            super().__init__(Path(root_dir).name, sample_rate, has_text)
-        if root_dir is None:
-            raise ValueError("root_dir must be provided.")
         self.root_dir = Path(root_dir)
-        # we assume that the root directory contains
-        wavs, texts = [], []
-        for wav_file in Path(root_dir).rglob("*.wav"):
-            wavs.append(wav_file)
-            if has_text:
-                text = wav_file.with_suffix(text_suffix)
-                texts.append(text)
-        self.wavs = wavs
-        if has_text:
-            self.texts = texts
+        name = self.root_dir.name
+        super().__init__(name=name, has_text=has_text, sample_rate=sample_rate)
+        self.text_suffix = text_suffix
+        self._files = None
 
-    def __len__(self) -> int:
-        if self.indices is not None:
-            return len(self.indices)
-        return len(self.wavs)
+    def get_files(self) -> List[Path]:
+        """Get list of all audio files in the dataset."""
+        if self._files is None:
+            self._files = sorted([
+                f for f in self.root_dir.rglob("*")
+                if f.suffix.lower() in [".wav", ".mp3", ".flac"]
+            ])
+        return self._files
 
-    def __getitem__(self, idx: int) -> Tuple[np.ndarray, str]:
-        if self.indices is not None:
-            idx = self.indices[idx]
-        wav, sr = self.wavs[idx], self.sample_rate
-        str_root = hash_md5(str(self.root_dir)) + "_" + hash_md5(str(wav))
-        wav_str = f"{str_root}_{sr}"
-        if check_cache(wav_str):
-            try:
-                audio = load_cache(wav_str)
-            except Exception as e:
-                print(f"Error loading cache for {wav_str}: {e}")
-                audio, _ = librosa.load(wav, sr=self.sample_rate)
-                cache(audio, wav_str)
-        else:
-            audio, _ = librosa.load(wav, sr=self.sample_rate)
-            cache(audio, wav_str)
+    def __len__(self):
+        return len(self.get_files())
+
+    def __getitem__(self, idx):
+        files = self.get_files()
+        audio_file = files[idx]
+        
+        # Load audio
+        audio = load_audio(audio_file, self.sample_rate)
+        
+        # Load text if available
+        text = None
         if self.has_text:
-            with open(self.texts[idx], "r", encoding="utf-8") as f:
-                text = f.read().replace("\n", "")
-        if audio.shape[0] < 16000:
-            print(f"(Almost) Empty audio file: {wav}, padding with zeros.")
-            audio = np.pad(audio, (0, 16000 - audio.shape[0]))
-        audio = audio / (np.max(np.abs(audio)) + 1e-6)
-        if self.has_text:
-            return audio, text
-        return audio
+            text_file = audio_file.with_suffix(self.text_suffix)
+            if text_file.exists():
+                text = text_file.read_text().strip()
+        
+        return {
+            "audio": audio,
+            "text": text,
+            "file_path": str(audio_file)
+        }
 
     def __hash__(self) -> int:
         h = hashlib.md5()

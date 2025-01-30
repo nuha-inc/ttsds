@@ -7,7 +7,7 @@ from enum import Enum
 import hashlib
 import importlib.resources
 import json
-from typing import List, Union, Optional
+from typing import List, Union, Optional, Tuple, Dict
 from functools import lru_cache
 from pathlib import Path
 
@@ -161,43 +161,99 @@ class Benchmark(ABC):
         h.update(json.dumps(kwargs_str, sort_keys=True).encode())
         return int(h.hexdigest(), 16)
 
-    @lru_cache(maxsize=None)
-    def compute_distance(
-        self,
-        one_dataset: Union[Dataset, DataDistribution],
-        other_dataset: Union[Dataset, DataDistribution],
-    ) -> float:
+    def compute_distance(self, dataset1: Dataset, dataset2: Dataset) -> float:
         """
-        Compute the distance between the distributions of the benchmark in two datasets.
+        Compute the distance between two datasets.
         """
-        one_distribution = self.get_distribution(one_dataset)
-        other_distribution = self.get_distribution(other_dataset)
+        dist1 = self.get_distribution(dataset1)
+        dist2 = self.get_distribution(dataset2)
+        
+        # Store per-file results for dataset2 (test dataset)
+        self.file_results = {}
+        for i, file_path in enumerate(dataset2.get_files()):
+            try:
+                file_score = self._compute_file_score(dist2[i] if isinstance(dist2, np.ndarray) else dist2, dist1)
+                self.file_results[str(file_path)] = {
+                    'score': float(file_score),
+                    'benchmark': self.name,
+                    'category': self.category.name
+                }
+            except Exception as e:
+                print(f"Error processing {file_path}: {str(e)}")
+                self.file_results[str(file_path)] = {
+                    'score': None,
+                    'error': str(e),
+                    'benchmark': self.name,
+                    'category': self.category.name
+                }
+        
+        # Compute overall distance based on dimension type
         if self.dimension == BenchmarkDimension.ONE_DIMENSIONAL:
-            return wasserstein_distance(one_distribution, other_distribution)
-        elif self.dimension == BenchmarkDimension.N_DIMENSIONAL:
-            return frechet_distance(one_distribution, other_distribution)
-        else:
-            raise ValueError("Invalid benchmark dimension")
+            return wasserstein_distance(dist1, dist2)
+        else:  # N_DIMENSIONAL
+            # Handle both direct arrays and (mu, sigma) tuples
+            if isinstance(dist1, tuple) and isinstance(dist2, tuple):
+                # For (mu, sigma) tuples, use Frechet distance directly
+                return frechet_distance(dist1[0], dist2[0], dist1[1], dist2[1])
+            else:
+                # For direct arrays, ensure proper shape
+                if isinstance(dist1, np.ndarray) and len(dist1.shape) == 1:
+                    dist1 = dist1.reshape(1, -1)
+                if isinstance(dist2, np.ndarray) and len(dist2.shape) == 1:
+                    dist2 = dist2.reshape(1, -1)
+                return frechet_distance(dist1, dist2)
+
+    def _compute_file_score(self, file_dist, reference_dist) -> float:
+        """
+        Compute score for a single file against reference distribution.
+        """
+        if self.dimension == BenchmarkDimension.ONE_DIMENSIONAL:
+            return wasserstein_distance(np.array([file_dist]), reference_dist)
+        else:  # N_DIMENSIONAL
+            # Handle both direct arrays and (mu, sigma) tuples
+            if isinstance(reference_dist, tuple):
+                # For (mu, sigma) tuples, compute distance to the mean
+                if isinstance(file_dist, tuple):
+                    return frechet_distance(file_dist[0], reference_dist[0], file_dist[1], reference_dist[1])
+                else:
+                    # If file_dist is a direct array, treat it as a single point
+                    if len(file_dist.shape) == 1:
+                        file_dist = file_dist.reshape(1, -1)
+                    return np.linalg.norm(file_dist.mean(axis=0) - reference_dist[0])
+            else:
+                # For direct arrays, use standard distance
+                if len(file_dist.shape) == 1:
+                    file_dist = file_dist.reshape(1, -1)
+                if len(reference_dist.shape) == 1:
+                    reference_dist = reference_dist.reshape(1, -1)
+                return frechet_distance(file_dist, reference_dist)
 
     def compute_score(
         self,
         dataset: Dataset,
         reference_datasets: List[Dataset],
         noise_datasets: List[Dataset],
-    ) -> float:
+    ) -> Tuple[float, float, Tuple[str, str], Dict]:
         """
         Compute the score of the benchmark on a dataset.
+        Now also returns per-file results.
         """
         noise_scores = []
+        noise_file_results = []
         for noise_ds in noise_datasets:
             score = self.compute_distance(noise_ds, dataset)
             noise_scores.append(score)
+            if hasattr(self, 'file_results'):
+                noise_file_results.append(self.file_results)
         noise_scores = np.array(noise_scores)
 
         dataset_scores = []
+        dataset_file_results = []
         for ref_ds in reference_datasets:
             score = self.compute_distance(ref_ds, dataset)
             dataset_scores.append(score)
+            if hasattr(self, 'file_results'):
+                dataset_file_results.append(self.file_results)
         dataset_scores = np.array(dataset_scores)
 
         closest_noise_idx = np.argmin(noise_scores)
@@ -210,9 +266,13 @@ class Benchmark(ABC):
 
         noise_score = np.min(noise_scores)
         dataset_score = np.min(dataset_scores)
+
         combined_score = dataset_score + noise_score
         score = (noise_score / combined_score) * 100
-        # TODO: compute confidence interval
+        
+        # Return the file results from the closest reference dataset
+        file_results = dataset_file_results[closest_dataset_idx] if dataset_file_results else {}
+        
         return (
             score,
             1.0,
@@ -220,4 +280,5 @@ class Benchmark(ABC):
                 noise_datasets[closest_noise_idx].name,
                 reference_datasets[closest_dataset_idx].name,
             ),
+            file_results
         )

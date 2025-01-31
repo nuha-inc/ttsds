@@ -101,10 +101,16 @@ class DirectoryDataset(Dataset):
     def get_files(self) -> List[Path]:
         """Get list of all audio files in the dataset."""
         if self._files is None:
-            self._files = sorted([
+            # Get all audio files
+            files = [
                 f for f in self.root_dir.rglob("*")
                 if f.suffix.lower() in [".wav", ".mp3", ".flac"]
-            ])
+            ]
+            
+            # Sort files numerically by stem (filename without extension)
+            # This handles both padded (001.wav) and unpadded (1.wav) filenames
+            self._files = sorted(files, key=lambda x: int(x.stem))
+            
         return self._files
 
     def __len__(self):
@@ -115,20 +121,28 @@ class DirectoryDataset(Dataset):
         audio_file = files[idx]
         
         # Load audio
-        audio = load_audio(audio_file, self.sample_rate)
+        try:
+            audio = load_audio(audio_file, self.sample_rate)
+            # Check for very short or empty audio
+            if audio.shape[0] < 100:  # Less than ~5ms at 22050Hz
+                print(f"(Almost) Empty audio file: {audio_file}, padding with zeros.")
+                audio = np.zeros(self.sample_rate)  # 1 second of silence
+            # Normalize audio
+            if np.any(audio):  # Only normalize if not all zeros
+                audio = audio / (np.max(np.abs(audio)) + 1e-6)
+        except Exception as e:
+            print(f"Error loading audio file {audio_file}: {str(e)}")
+            print("Returning 1 second of silence instead")
+            audio = np.zeros(self.sample_rate)  # 1 second of silence
         
         # Load text if available
-        text = None
         if self.has_text:
             text_file = audio_file.with_suffix(self.text_suffix)
             if text_file.exists():
                 text = text_file.read_text().strip()
+                return audio, text
         
-        return {
-            "audio": audio,
-            "text": text,
-            "file_path": str(audio_file)
-        }
+        return audio
 
     def __hash__(self) -> int:
         h = hashlib.md5()
@@ -200,7 +214,20 @@ class TarDataset(Dataset):
             else:
                 wav = str(wav)
             wav_file = self.tar.extractfile(wav)
-            audio, _ = librosa.load(wav_file, sr=self.sample_rate)
+            
+            # Create a temporary file to properly handle the WAV data
+            import tempfile
+            import os
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
+                temp_wav.write(wav_file.read())
+                temp_wav.flush()
+                # Load using the temporary file
+                try:
+                    audio, _ = librosa.load(temp_wav.name, sr=self.sample_rate)
+                finally:
+                    # Clean up the temporary file
+                    os.unlink(temp_wav.name)
+            
             cache(audio, wav_str)
         if self.has_text:
             if self.path_prefix is not None:

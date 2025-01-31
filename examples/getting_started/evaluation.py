@@ -23,7 +23,7 @@ args.add_argument("--device", type=str, default="cpu")
 args.add_argument("--multiprocessing", action=BooleanOptionalAction)
 args.add_argument("--no-text", action=BooleanOptionalAction)
 
-noise_datasets = sorted(list(Path("noise-reference").rglob("*.tar.gz")))
+noise_datasets = sorted(list(Path("datasets/noise-reference").rglob("*.tar.gz")))
 noise_datasets = [TarDataset(x, text_suffix=".txt") for x in noise_datasets]
 
 

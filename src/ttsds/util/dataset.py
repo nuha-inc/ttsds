@@ -10,7 +10,9 @@ import tarfile
 from typing import Tuple, List, Dict, Union
 import pickle
 import gzip
-
+  # Create a temporary file to properly handle the WAV data
+import tempfile
+import os
 import numpy as np
 import librosa
 from multiprocessing import cpu_count
@@ -215,9 +217,7 @@ class TarDataset(Dataset):
                 wav = str(wav)
             wav_file = self.tar.extractfile(wav)
             
-            # Create a temporary file to properly handle the WAV data
-            import tempfile
-            import os
+          
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
                 temp_wav.write(wav_file.read())
                 temp_wav.flush()

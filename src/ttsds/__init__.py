@@ -52,7 +52,7 @@ BENCHMARKS_V1 = {
     "wespeaker": WeSpeakerBenchmark,
     "dvector": DVectorBenchmark,
     "hubert_token": HubertTokenBenchmark,
-    "voicefixer": VoiceFixerBenchmark,
+    # "voicefixer": VoiceFixerBenchmark,
     "wada_snr": WadaSNRBenchmark,
 }
 
@@ -78,33 +78,24 @@ class BenchmarkSuite:
         benchmark_kwargs: dict = {},
         device: str = "cpu",
     ):
-        if (
-            "hubert_token" not in benchmark_kwargs
-            or "cluster_datasets" not in benchmark_kwargs["hubert_token"]
-        ):
-            if "hubert_token" not in benchmark_kwargs:
-                benchmark_kwargs["hubert_token"] = {}
-            benchmark_kwargs["hubert_token"]["cluster_datasets"] = [
-                reference_datasets[0].sample(min(100, len(reference_datasets[0])))
-            ]
-        if (
-            "hubert_token_sr" not in benchmark_kwargs
-            or "cluster_datasets" not in benchmark_kwargs["hubert_token_sr"]
-        ):
-            if "hubert_token_sr" not in benchmark_kwargs:
-                benchmark_kwargs["hubert_token_sr"] = {}
-            benchmark_kwargs["hubert_token_sr"]["cluster_datasets"] = [
-                reference_datasets[0].sample(min(100, len(reference_datasets[0])))
-            ]
-        self.benchmarks = {
-            k: v(**benchmark_kwargs.get(k, {}))
-            for k, v in benchmarks.items()
-        }
-        # if gpu is available, move the benchmarks that support it to the gpu
-        for benchmark in self.benchmarks.values():
-            if DeviceSupport.GPU in benchmark.supported_devices and device == "cuda":
-                benchmark.to_device(device)
+        # Extract bootstrap parameters from benchmark_kwargs
+        self.bootstrap = benchmark_kwargs.get('bootstrap', False)
+        self.n_bootstrap = benchmark_kwargs.get('n_bootstrap', 1000)
+        self.confidence = benchmark_kwargs.get('confidence', 0.95)
+        self.save_detailed = benchmark_kwargs.get('save_detailed', False)
+        
         self.datasets = datasets
+        self.benchmarks = benchmarks
+        self.print_results = print_results
+        self.skip_errors = skip_errors
+        self.device = device
+        
+        # Initialize database if needed
+        if write_to_file is not None and Path(write_to_file).exists():
+            self.database = pd.read_csv(write_to_file)
+        else:
+            self.database = pd.DataFrame()
+        
         self.datasets = sorted(self.datasets, key=lambda x: x.name)
         self.database = pd.DataFrame(
             columns=[
@@ -118,19 +109,41 @@ class BenchmarkSuite:
                 "reference_dataset",
             ]
         )
-        self.print_results = print_results
-        self.skip_errors = skip_errors
         self.noise_datasets = noise_datasets
         self.reference_datasets = reference_datasets
         self.multiprocessing = multiprocessing
         self.n_processes = n_processes
         self.file_results = {}  # Store file-level results
 
+        # Initialize benchmarks with proper parameters
+        benchmark_init_kwargs = benchmark_kwargs.copy()
+        if "hubert_token" not in benchmark_init_kwargs:
+            benchmark_init_kwargs["hubert_token"] = {}
+        if "cluster_datasets" not in benchmark_init_kwargs["hubert_token"]:
+            benchmark_init_kwargs["hubert_token"]["cluster_datasets"] = [
+                reference_datasets[0].sample(min(100, len(reference_datasets[0])))
+            ]
+        
+        if "hubert_token_sr" not in benchmark_init_kwargs:
+            benchmark_init_kwargs["hubert_token_sr"] = {}
+        if "cluster_datasets" not in benchmark_init_kwargs["hubert_token_sr"]:
+            benchmark_init_kwargs["hubert_token_sr"]["cluster_datasets"] = [
+                reference_datasets[0].sample(min(100, len(reference_datasets[0])))
+            ]
+
+        self.benchmarks = {
+            k: v(**benchmark_init_kwargs.get(k, {}))
+            for k, v in benchmarks.items()
+        }
+
+        # Move benchmarks to GPU if supported
+        for benchmark in self.benchmarks.values():
+            if DeviceSupport.GPU in benchmark.supported_devices and device == "cuda":
+                benchmark.to_device(device)
+
         if self.multiprocessing:
             if len(benchmarks) > len(noise_datasets) + len(reference_datasets):
-                print(
-                    f"Running benchmarks without multiprocessing"
-                )
+                print(f"Running benchmarks without multiprocessing")
                 self.noise_distributions = [
                     DataDistribution(
                         ds,
@@ -148,6 +161,7 @@ class BenchmarkSuite:
                         name=ds.name,
                         multiprocessing=self.multiprocessing,
                         n_processes=self.n_processes,
+                        cache_distributions=not self.bootstrap  # Disable caching if bootstrapping
                     )
                     for ds in reference_datasets
                 ]
@@ -157,7 +171,7 @@ class BenchmarkSuite:
                 with ThreadPoolExecutor(max_workers=self.n_processes) as executor:
                     results = list(
                         executor.map(
-                            lambda x: self.get_data_distribution(x, self.benchmarks),
+                            lambda x: self.get_data_distribution(x, self.benchmarks, is_reference=x in reference_datasets),
                             tasks,
                         )
                     )
@@ -169,7 +183,7 @@ class BenchmarkSuite:
                 for ds in noise_datasets
             ]
             self.reference_distributions = [
-                self.get_data_distribution(ds, self.benchmarks)
+                self.get_data_distribution(ds, self.benchmarks, is_reference=True)
                 for ds in reference_datasets
             ]
         self.write_to_file = write_to_file
@@ -177,12 +191,13 @@ class BenchmarkSuite:
             self.database = pd.read_csv(write_to_file, index_col=0)
             self.database = self.database.reset_index()
 
-    def get_data_distribution(self, dataset: Dataset, benchmarks: Dict[str, "Benchmark"]) -> DataDistribution:
+    def get_data_distribution(self, dataset: Dataset, benchmarks: Dict[str, "Benchmark"], is_reference: bool = False) -> DataDistribution:
         return DataDistribution(
             dataset,
             benchmarks=benchmarks,
-            name=dataset.name,
+            name=dataset.name if not dataset.name.startswith("speech_") else f"speech_{dataset.name}",
             multiprocessing=False,
+            cache_distributions=not (self.bootstrap and is_reference)  # Disable caching for reference datasets if bootstrapping
         )
 
     def _get_distribution(self, benchmark: "Benchmark", dataset: Dataset) -> np.ndarray:
@@ -198,13 +213,18 @@ class BenchmarkSuite:
             print(f"Running {benchmark.name} on {dataset.name}")
         try:
             start = time()
+            # Pass bootstrap parameters to compute_score
             score, ci, datasets, file_results = benchmark.compute_score(
-                dataset, self.reference_distributions, self.noise_distributions
+                dataset, 
+                self.reference_distributions, 
+                self.noise_distributions,
+                n_bootstrap=self.n_bootstrap if self.bootstrap else 0,
+                confidence=self.confidence
             )
             time_taken = time() - start
             
-            # Store file results
-            if file_results:
+            # Store file results if enabled
+            if self.save_detailed and file_results:
                 if dataset.name not in self.file_results:
                     self.file_results[dataset.name] = {}
                 self.file_results[dataset.name][benchmark.name] = file_results
@@ -212,7 +232,8 @@ class BenchmarkSuite:
         except Exception as e:
             if self.skip_errors:
                 print(f"Error: {e}")
-                score = (np.nan, np.nan)
+                score = np.nan
+                ci = (0.0, 0.0)
                 time_taken = np.nan
                 datasets = (None, None)
             else:
@@ -223,7 +244,7 @@ class BenchmarkSuite:
             "benchmark_category": [benchmark.category.value],
             "dataset": [dataset.name],
             "score": [score],
-            "ci": [ci],
+            "ci": [f"{ci[0]:.6f},{ci[1]:.6f}" if isinstance(ci, tuple) else "0.0,0.0"],
             "time_taken": [time_taken],
             "noise_dataset": [datasets[0]],
             "reference_dataset": [datasets[1]],
@@ -258,6 +279,9 @@ class BenchmarkSuite:
         for result in results:
             if self.print_results:
                 print(result)
+            # Convert confidence interval tuple to string for storage
+            if isinstance(result['ci'][0], tuple):
+                result['ci'] = [f"{result['ci'][0][0]:.6f},{result['ci'][0][1]:.6f}"]
             self.database = pd.concat(
                 [
                     self.database,
@@ -267,6 +291,14 @@ class BenchmarkSuite:
             )
             if self.write_to_file is not None:
                 self.database["score"] = self.database["score"].astype(float)
+                # Convert stored CI string back to tuple when needed
+                if 'ci' in self.database.columns:
+                    def parse_ci(ci_str):
+                        if isinstance(ci_str, str) and ',' in ci_str:
+                            width, conf = ci_str.split(',')
+                            return (float(width), float(conf))
+                        return (0.0, 0.0)
+                    self.database["ci"] = self.database["ci"].apply(parse_ci)
                 self.database = self.database.sort_values(
                     ["benchmark_category", "benchmark_name", "score"],
                     ascending=[True, True, False],

@@ -336,6 +336,7 @@ class DataDistribution:
         name: str = None,
         multiprocessing: bool = False,
         n_processes: int = 1,
+        cache_distributions: bool = True,  # Whether to pre-compute and cache distributions
     ):
         if name is not None:
             self.name = name
@@ -345,8 +346,9 @@ class DataDistribution:
         self.benchmark_results = {}
         self.multiprocessing = multiprocessing
         self.n_processes = n_processes
-        if dataset is not None:
-            self.dataset = dataset
+        self.dataset = dataset
+        self.cache_distributions = cache_distributions
+        if dataset is not None and cache_distributions:
             self.run()
 
     def run(self):
@@ -383,9 +385,28 @@ class DataDistribution:
         return dist
 
     def get_distribution(self, benchmark_name: str) -> np.ndarray:
-        if benchmark_name not in self.benchmark_results:
-            self.run()
-        return self.benchmark_results[benchmark_name]
+        """Get the distribution for a benchmark.
+        
+        If cache_distributions is True, returns the pre-computed distribution.
+        Otherwise, computes the distribution on-the-fly.
+        """
+        if self.cache_distributions:
+            if benchmark_name not in self.benchmark_results:
+                self.run()
+            return self.benchmark_results[benchmark_name]
+        else:
+            # Compute distribution on-the-fly
+            bench = self.benchmarks[benchmark_name]
+            dist = bench.get_distribution(self.dataset)
+            if bench.dimension.name == "N_DIMENSIONAL":
+                mu = np.mean(dist, axis=0)
+                sigma = np.cov(dist, rowvar=False)
+                dist = (mu, sigma)
+            return dist
+
+    def get_dataset(self) -> Dataset:
+        """Get the underlying dataset for bootstrapping."""
+        return self.dataset
 
     def to_pickle(self, path: str):
         with gzip.open(path, "wb") as f:
